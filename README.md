@@ -31,6 +31,14 @@ Plot intensities along a line in [napari].
 
 To see how these steps can be done programmatically from python, check out the [demo notebook](https://github.com/haesleinhuepf/napari-plot-profile/blob/main/docs/demo.ipynb)
 
+## Working with n-dimensional and OME-Zarr data
+
+Profiles work on n-dimensional, multiscale and lazily loaded images, such as 5D (t, c, z, y, x) OME-Zarr
+files opened with [napari-ome-zarr](https://github.com/ome/napari-ome-zarr). The line is taken in the
+displayed dimensions; all other dimensions (time, z, ...) follow the viewer's sliders, so scrolling updates
+the profile. Coordinates are converted per layer using its scale, translation and affine, distances are in
+world (physical) units, and only the pixels under the line are read from the full-resolution level.
+
 ## Working with RGB images
 
 When working with RGB images, you need to split them into three different layers first in napari.
