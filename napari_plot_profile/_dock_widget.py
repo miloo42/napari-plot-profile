@@ -151,19 +151,20 @@ class PlotProfile(QWidget):
         add_table(first_selected_layer, self._viewer)
 
     def _get_current_line(self):
-        line = None
+        """Return the current line as an (n_vertices, viewer_ndim) array in world coordinates.
+
+        Displayed dimensions come from the line; all other dimensions (e.g. time,
+        channel, z in 2D view) come from the viewer's current slider position, so
+        the profile follows the slice being looked at.
+        """
         for layer in self._viewer.layers.selection:
             if isinstance(layer, napari.layers.Shapes):
                 selection = list(layer.selected_data)
                 if len(selection) > 0:
-                    line = layer.data[selection[0]]
-                    break
-                try:
-                    line = layer.data[-1]
-                    break
-                except IndexError:
-                    pass
-        return line
+                    return line_to_world(layer.data[selection[0]], layer, self._viewer.dims)
+                if len(layer.data) > 0:
+                    return line_to_world(layer.data[-1], layer, self._viewer.dims)
+        return None
 
     def redraw(self, force_redraw : bool = False):
 
@@ -175,12 +176,13 @@ class PlotProfile(QWidget):
 
 
         if not force_redraw:
-            if self._former_line is not None and np.array_equal(line, self._former_line):
+            if self._former_line is not None and self._former_line.shape == line.shape \
+                    and np.array_equal(line, self._former_line):
                 return
 
         self._reset_plot()
 
-        self._former_line = line + 0
+        self._former_line = line.copy()
 
         # clean up
         layout = self._labels.layout()
@@ -234,57 +236,101 @@ class LayerLabelWidget(QWidget):
         lbl.setStyleSheet('color: #%02x%02x%02x' % tuple(color.astype(int)))
         self.layout().addWidget(lbl)
 
+def line_to_world(line, shapes_layer, dims):
+    """Convert a shape's vertices to world coordinates spanning all viewer dimensions.
+
+    Coordinates along the displayed dimensions are taken from the shape; the
+    remaining (sliced) dimensions are taken from the viewer's current position.
+    This makes a 2D line drawn on e.g. a 5D (t, c, z, y, x) dataset sample the
+    currently shown time point / channel / plane.
+    """
+    current = np.asarray(dims.point, dtype=float)
+    displayed = list(dims.displayed)
+    world_line = np.tile(current, (len(line), 1))
+    for i, vertex in enumerate(np.asarray(line, dtype=float)):
+        vertex_world = np.asarray(shapes_layer.data_to_world(vertex), dtype=float)
+        full = current.copy()
+        n = min(len(vertex_world), len(full))
+        full[len(full) - n:] = vertex_world[len(vertex_world) - n:]
+        world_line[i, displayed] = full[displayed]
+    return world_line
+
+
+def _layer_level0_data(layer):
+    """Full-resolution array of an image layer (first pyramid level for multiscale data)."""
+    return layer.data[0] if layer.multiscale else layer.data
+
+
+def _read_points(data, positions):
+    """Read values at integer positions (n_points, ndim) without loading the whole array."""
+    if len(positions) == 0:
+        return np.asarray([])
+    index = tuple(positions.T)
+    if isinstance(data, np.ndarray):
+        return data[index]
+    if hasattr(data, 'vindex'):
+        # dask and zarr arrays: point-wise indexing, only touches the chunks hit by the line
+        return np.asarray(data.vindex[index])
+    # other array-likes: read the bounding box around the samples only
+    lower = positions.min(axis=0)
+    upper = positions.max(axis=0) + 1
+    block = np.asarray(data[tuple(slice(lo, hi) for lo, hi in zip(lower, upper))])
+    return block[tuple((positions - lower).T)]
+
+
 def profile(layer, line, num_points : int = 256):
-    distance = 0
-    former_point = None
-    intermediate_distances = [0]
-    for point in line:
-        if former_point is not None:
-            distance = distance + np.linalg.norm(point - former_point)
-            intermediate_distances.append(distance)
-        former_point = point
-    intermediate_distances.append(intermediate_distances[-1])
+    """Sample intensities of an image layer along a polyline.
 
-    step = distance / (num_points - 1)
+    Parameters
+    ----------
+    layer : napari.layers.Image
+        Image layer; may be n-dimensional, multiscale (e.g. OME-Zarr pyramids) and
+        backed by lazy arrays (dask, zarr). Only the pixels along the line are read.
+    line : array of shape (n_vertices, n_dims)
+        Polyline in world coordinates. If it has more dimensions than the layer, the
+        trailing ones are used; if fewer, leading dimensions are taken as 0.
+    num_points : int
+        Number of sample points along the line.
 
-    positions = []
-    distances = []
+    Returns
+    -------
+    dict with 'positions' (integer pixel indices in the layer's full-resolution data),
+    'distances' (along the line, in world units) and 'intensities'.
+    """
+    line = np.asarray(line, dtype=float)
+    if line.ndim != 2 or len(line) == 0:
+        return {'positions': [], 'distances': [], 'intensities': []}
 
-    current_line = 0
-    for i in range(num_points):
-        distance = i * step
-        while current_line < len(intermediate_distances) - 1 and distance > intermediate_distances[current_line + 1]:
-            current_line += 1
-        start = line[min(current_line, len(line) - 1)] / layer.scale
-        end = line[min(current_line + 1, len(line) - 1)] / layer.scale
+    # cumulative world-space distance at every vertex
+    segment_lengths = np.linalg.norm(np.diff(line, axis=0), axis=1)
+    vertex_distances = np.concatenate([[0.0], np.cumsum(segment_lengths)])
+    total = vertex_distances[-1]
 
+    # world positions of evenly spaced samples along the polyline
+    sample_distances = np.linspace(0, total, num_points) if total > 0 else np.zeros(1)
+    if total > 0:
+        samples_world = np.stack([np.interp(sample_distances, vertex_distances, line[:, d])
+                                  for d in range(line.shape[1])], axis=1)
+    else:
+        samples_world = line[:1]
 
-        position_on_line = distance - intermediate_distances[current_line]
-        if current_line == len(intermediate_distances)-1:
-            relative_position = 0
-        else:
-            line_length = intermediate_distances[current_line + 1] - intermediate_distances[current_line]
-            relative_position = position_on_line / line_length
-        position = end * relative_position + start * (1.0 - relative_position)
+    # world -> layer data coordinates (handles scale, translate, rotate, affine, and
+    # world/layer dimensionality mismatch); nearest pixel
+    data_positions = np.array([layer.world_to_data(p) for p in samples_world], dtype=float)
+    data_positions = np.round(data_positions).astype(int)
 
-        # check if point still within image
-        position_clipped = np.maximum(position, np.zeros(position.shape))
-        position_clipped = np.minimum(position_clipped, layer.data.shape - np.ones(position.shape))
-        if np.array_equal(position, position_clipped):
-            position = position.astype(int)
-            positions.append(position)
-            distances.append(i * step)
+    data = _layer_level0_data(layer)
+    spatial_shape = np.asarray(data.shape[:layer.ndim])  # excludes RGB(A) channel axis
+    inside = np.all((data_positions >= 0) & (data_positions < spatial_shape), axis=1)
+    positions = data_positions[inside]
+    distances = sample_distances[inside]
 
-    data = layer.data
-    if "dask" in str(type(data)):
-        data = np.asarray(data)
-
-    intensities = [data[tuple(position)] for position in positions]
+    intensities = _read_points(data, positions)
 
     return {
-        'positions': positions,
-        'distances': distances,
-        'intensities': intensities
+        'positions': list(positions),
+        'distances': list(distances),
+        'intensities': list(intensities)
     }
 
 def min_max(data):
